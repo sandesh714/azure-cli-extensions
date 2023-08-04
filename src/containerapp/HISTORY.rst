@@ -3,6 +3,16 @@
 Release History
 ===============
 
+Upcoming
+++++++
+* 'az containerapp job start': update start execution payload format to exlude template property from API version 2023-05-01 onwards
+* 'az containerapp service': add support for creation and deletion of MariaDB
+* 'az containerapp create/list': support --environment-type parameter
+
+0.3.36
+++++++
+* 'az containerapp hostname bind': fix exception when not bringing --validation-method inputs
+
 0.3.35
 ++++++
 * 'az containerapp create/update': --termination-grace-period support custom termination grace period

@@ -20,7 +20,8 @@ from knack.util import CLIError
 from msrestazure.tools import parse_resource_id, is_valid_resource_id
 from msrest.exceptions import DeserializationError
 
-from ._clients import ManagedEnvironmentClient
+from .base_resource import BaseResource
+from ._clients import ManagedEnvironmentClient, ConnectedEnvironmentClient, ManagedEnvironmentPreviewClient
 from ._client_factory import handle_raw_exception, handle_non_404_exception
 
 from ._models import (
@@ -49,39 +50,56 @@ from ._utils import (_ensure_location_allowed,
                      _remove_readonly_attributes,
                      _infer_acr_credentials,
                      _ensure_identity_resource_id,
-                     validate_container_app_name, register_provider_if_needed,
+                     validate_container_app_name,
                      set_managed_identity,
                      create_acrpull_role_assignment, is_registry_msi_system,
                      safe_set, parse_metadata_flags, parse_auth_flags,
                      get_default_workload_profile_name_from_env,
                      ensure_workload_profile_supported, _generate_secret_volume_name,
                      parse_service_bindings, check_unique_bindings, AppType, get_linker_client,
-                     _validate_subscription_registered, safe_get)
+                     safe_get)
 from ._validators import validate_create, validate_revision_suffix
 
 from ._constants import (CONTAINER_APPS_RP,
-                         HELLO_WORLD_IMAGE)
+                         HELLO_WORLD_IMAGE,
+                         CONNECTED_ENVIRONMENT_TYPE,
+                         CONNECTED_ENVIRONMENT_RESOURCE_TYPE,
+                         MANAGED_ENVIRONMENT_TYPE,
+                         MANAGED_ENVIRONMENT_RESOURCE_TYPE)
 
 logger = get_logger(__name__)
 
 
-class BaseContainerAppDecorator:
-    def __init__(
-        self, cmd: AzCliCommand, client: Any, raw_parameters: Dict, models: str
-    ):
-        self.raw_param = raw_parameters
-        self.cmd = cmd
-        self.client = client
-        self.models = models
+class BaseContainerAppDecorator(BaseResource):
+    def __init__(self, cmd: AzCliCommand, client: Any, raw_parameters: Dict, models: str):
+        super().__init__(cmd, client, raw_parameters, models)
 
-    def register_provider(self, *rp_name_list):
-        for rp in rp_name_list:
-            register_provider_if_needed(self.cmd, rp)
+    def list(self):
+        containerapps = super().list()
+        managed_env = self.get_argument_managed_env()
+        if managed_env:
+            env_name = parse_resource_id(managed_env)["name"].lower()
+            if "resource_group" in parse_resource_id(managed_env):
+                self.get_environment_client().show(self.cmd, parse_resource_id(managed_env)["resource_group"],
+                                                   parse_resource_id(managed_env)["name"])
+                containerapps = [c for c in containerapps if
+                                 c["properties"]["environmentId"].lower() == managed_env.lower()]
+            else:
+                containerapps = [c for c in containerapps if
+                                 parse_resource_id(c["properties"]["environmentId"])["name"].lower() == env_name]
 
-    def validate_subscription_registered(self, *rp_name_list):
-        for rp in rp_name_list:
-            _validate_subscription_registered(self.cmd, rp)
+        return containerapps
 
+    def show(self):
+        try:
+            r = super().show()
+            if self.get_param("show_secrets"):
+                self.set_up_get_existing_secrets(r)
+            return r
+        except CLIError as e:
+            handle_raw_exception(e)
+
+    # deprecate, will be removed in the future
     def list_containerapp(self):
         try:
             resource_group_name = self.get_argument_resource_group_name()
@@ -103,6 +121,7 @@ class BaseContainerAppDecorator:
         except CLIError as e:
             handle_raw_exception(e)
 
+    # deprecate, will be removed in the future
     def show_containerapp(self):
         try:
             r = self.client.show(cmd=self.cmd, resource_group_name=self.get_argument_resource_group_name(), name=self.get_argument_name())
@@ -112,6 +131,7 @@ class BaseContainerAppDecorator:
         except CLIError as e:
             handle_raw_exception(e)
 
+    # deprecate, will be removed in the future
     def delete_containerapp(self):
         try:
             return self.client.delete(cmd=self.cmd, name=self.get_argument_name(), resource_group_name=self.get_argument_resource_group_name(), no_wait=self.get_argument_no_wait())
@@ -705,3 +725,94 @@ class ContainerAppCreateDecorator(BaseContainerAppDecorator):
             scale_def["rules"] = [scale_rule_def]
 
         return scale_def
+
+
+# decorator for preview create
+class ContainerAppPreviewCreateDecorator(ContainerAppCreateDecorator):
+    def __init__(
+        self, cmd: AzCliCommand, client: Any, raw_parameters: Dict, models: str
+    ):
+        super().__init__(cmd, client, raw_parameters, models)
+
+    def construct_containerapp(self):
+        super().construct_containerapp()
+        self.set_up_extended_location()
+
+    def set_up_extended_location(self):
+        if self.get_argument_environment_type() == CONNECTED_ENVIRONMENT_TYPE:
+            if not self.containerapp_def.get('extendedLocation'):
+                parsed_env = parse_resource_id(self.get_argument_managed_env())  # custom_location check here perhaps
+                env_name = parsed_env['name']
+                env_rg = parsed_env['resource_group']
+                env_info = self.get_environment_client().show(cmd=self.cmd, resource_group_name=env_rg, name=env_name)
+                self.containerapp_def["extendedLocation"] = env_info["extendedLocation"]
+
+    def get_environment_client(self):
+        if self.get_argument_yaml():
+            env = safe_get(self.containerapp_def, "properties", "environmentId")
+        else:
+            env = self.get_argument_managed_env()
+
+        environment_type = self.get_argument_environment_type()
+        if not env and not environment_type:
+            return ManagedEnvironmentClient
+
+        parsed_env = parse_resource_id(env)
+
+        # Validate environment type
+        if parsed_env.get('resource_type').lower() == CONNECTED_ENVIRONMENT_RESOURCE_TYPE.lower():
+            if environment_type == MANAGED_ENVIRONMENT_TYPE:
+                logger.warning("User passed a connectedEnvironment resource id but did not specify --environment-type connected. Using environment type connected.")
+            environment_type = CONNECTED_ENVIRONMENT_TYPE
+        else:
+            if environment_type == CONNECTED_ENVIRONMENT_TYPE:
+                logger.warning("User passed a managedEnvironment resource id but specified --environment-type connected. Using environment type managed.")
+            environment_type = MANAGED_ENVIRONMENT_TYPE
+
+        self.set_argument_environment_type(environment_type)
+        self.set_argument_managed_env(env)
+
+        if environment_type == CONNECTED_ENVIRONMENT_TYPE:
+            return ConnectedEnvironmentClient
+        else:
+            return ManagedEnvironmentPreviewClient
+
+    def get_argument_environment_type(self):
+        return self.get_param("environment_type")
+
+    def set_argument_environment_type(self, environment_type):
+        self.set_param("environment_type", environment_type)
+
+
+# decorator for preview list
+class ContainerAppPreviewListDecorator(BaseContainerAppDecorator):
+    def __init__(
+        self, cmd: AzCliCommand, client: Any, raw_parameters: Dict, models: str
+    ):
+        super().__init__(cmd, client, raw_parameters, models)
+
+    def list(self):
+        containerapps = super().list()
+        if self.get_argument_environment_type() == CONNECTED_ENVIRONMENT_TYPE:
+            containerapps = [c for c in containerapps if CONNECTED_ENVIRONMENT_RESOURCE_TYPE in c["properties"]["environmentId"]]
+        if self.get_argument_environment_type() == MANAGED_ENVIRONMENT_TYPE:
+            containerapps = [c for c in containerapps if MANAGED_ENVIRONMENT_RESOURCE_TYPE in c["properties"]["environmentId"]]
+        return containerapps
+
+    def get_environment_client(self):
+        env = self.get_argument_managed_env()
+
+        if is_valid_resource_id(env):
+            parsed_env = parse_resource_id(env)
+            if parsed_env.get('resource_type').lower() == CONNECTED_ENVIRONMENT_RESOURCE_TYPE.lower():
+                return ConnectedEnvironmentClient
+            else:
+                return ManagedEnvironmentPreviewClient
+
+        if self.get_argument_environment_type() == CONNECTED_ENVIRONMENT_TYPE:
+            return ConnectedEnvironmentClient
+        else:
+            return ManagedEnvironmentPreviewClient
+
+    def get_argument_environment_type(self):
+        return self.get_param("environment_type")
